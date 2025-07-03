@@ -29,18 +29,19 @@ Ideal para exponer tu base como una API moderna con soporte de filtros, selecci�
 
 Cloná el repositorio (o copiá estos archivos en tu proyecto):
 
-git clone https://github.com/tu-usuario/mysql-to-rest.git
-cd mysql-to-rest
+git clone https://github.com/Gizmedic-Org/MySQL-to-REST.git
+cd MySQL-to-REST
 
 Configura tu conexión a MySQL creando un archivo .env en el mismo directorio que docker-compose.yml con tu cadena de conexión:
 
 DATABASE_URL="mysql+pymysql://usuario:contraseña@host:puerto/nombre_base"
+API_PORT=8055
 
 Arrancá el contenedor:
 
 docker compose up --build
 
-La API estará disponible en http://localhost:8055 (o el puerto que definas).
+La API estará disponible en http://localhost:8055 (o el puerto que definas en .env).
 
 ---
 
