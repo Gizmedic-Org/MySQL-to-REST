@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    ports:
+      - "8055:8000"
+    networks:
+      - fastapi-net
+
+networks:
+  fastapi-net:
+    driver: bridge
