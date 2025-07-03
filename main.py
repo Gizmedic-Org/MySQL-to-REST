@@ -18,43 +18,143 @@ metadata = MetaData()
 metadata.reflect(bind=engine)
 inspector = Inspector.from_engine(engine)
 
-def simple_odata_filter_to_sql(odata_filter, columns):
-    allowed_ops = {
-        'eq': '=',
-        'ne': '!=',
-        'gt': '>',
-        'ge': '>=',
-        'lt': '<',
-        'le': '<='
-    }
-    odata_filter = odata_filter.replace(" and ", " AND ").replace(" or ", " OR ")
-    def contains_replace(match):
-        field = match.group(1)
-        value = match.group(2).replace("'", "''")
-        if field not in columns:
-            return ""
-        return f"{field} LIKE '%{value}%'"
-    odata_filter = re.sub(r"contains\((\w+),\s*'([^']*)'\)", contains_replace, odata_filter)
-    def op_replace(match):
-        field, op, value = match.groups()
-        field = field.strip()
-        op = op.strip()
-        value = value.strip()
-        if field not in columns:
-            return ""
-        sql_op = allowed_ops.get(op)
-        if not sql_op:
-            return ""
-        if value.startswith("'") and value.endswith("'"):
-            value = value.replace("'", "''")
-            return f"{field} {sql_op} '{value[1:-1]}'"
-        else:
-            return f"{field} {sql_op} {value}"
-    pattern = r"(\w+)\s+(eq|ne|gt|ge|lt|le)\s+('[^']*'|[\d.]+)"
-    sql = re.sub(pattern, op_replace, odata_filter)
-    return sql
+# ----------------------------------------
+# ODATA $filter advanced parser (safe)
+# ----------------------------------------
 
-def simple_odata_orderby_to_sql(orderby_str, columns):
+def tokenize_filter(s):
+    # Simple lexer for OData expressions (only the supported subset)
+    token_specification = [
+        ('LPAREN', r'\('),
+        ('RPAREN', r'\)'),
+        ('AND', r'\band\b'),
+        ('OR', r'\bor\b'),
+        ('OP', r'\b(eq|ne|gt|ge|lt|le)\b'),
+        ('CONTAINS', r'contains'),
+        ('COMMA', r','),
+        ('STRING', r"'([^']*)'"),
+        ('NUMBER', r'-?\d+(\.\d+)?'),
+        ('ID', r'[A-Za-z_][A-Za-z0-9_]*'),
+        ('SKIP', r'[ \t]+'),
+        ('MISMATCH', r'.'),
+    ]
+    tok_regex = '|'.join('(?P<%s>%s)' % pair for pair in token_specification)
+    for mo in re.finditer(tok_regex, s):
+        kind = mo.lastgroup
+        value = mo.group()
+        if kind == 'SKIP':
+            continue
+        elif kind == 'STRING':
+            value = mo.group(1)
+        elif kind == 'NUMBER':
+            value = float(value) if '.' in value else int(value)
+        elif kind == 'MISMATCH':
+            raise RuntimeError(f'Unexpected character: {value}')
+        yield (kind, value)
+
+def parse_filter_expr(tokens, columns, param_idx=0):
+    def peek():
+        return tokens[0] if tokens else None
+    def pop():
+        return tokens.pop(0) if tokens else None
+
+    def parse_atom():
+        nonlocal param_idx
+        tok = peek()
+        if not tok:
+            raise RuntimeError("Unexpected end of filter expression")
+        kind, value = tok
+        if kind == 'LPAREN':
+            pop()
+            expr, params = parse_expr()
+            if not tokens or tokens[0][0] != 'RPAREN':
+                raise RuntimeError("Expected ')'")
+            pop()
+            return f"({expr})", params
+        elif kind == 'CONTAINS':
+            pop()
+            if not tokens or tokens[0][0] != 'LPAREN':
+                raise RuntimeError("Expected '(' after contains")
+            pop()
+            # next token: field
+            if not tokens or tokens[0][0] != 'ID':
+                raise RuntimeError("Expected field name in contains")
+            field = tokens.pop(0)[1]
+            if field not in columns:
+                raise RuntimeError(f"Invalid field '{field}' in contains")
+            if not tokens or tokens[0][0] != 'COMMA':
+                raise RuntimeError("Expected ',' after field in contains")
+            pop()
+            if not tokens or tokens[0][0] != 'STRING':
+                raise RuntimeError("Expected string in contains")
+            value_str = tokens.pop(0)[1]
+            if not tokens or tokens[0][0] != 'RPAREN':
+                raise RuntimeError("Expected ')' at end of contains")
+            pop()
+            pname = f"p{param_idx}"
+            param_idx_local = param_idx
+            param_idx += 1
+            return f"{field} LIKE :{pname}", {pname: f"%{value_str}%"}
+        elif kind == 'ID':
+            field = value
+            if field not in columns:
+                raise RuntimeError(f"Invalid field '{field}'")
+            pop()
+            # next: OP
+            if not tokens or tokens[0][0] != 'OP':
+                raise RuntimeError("Expected operator after field")
+            op = tokens.pop(0)[1]
+            # next: STRING or NUMBER
+            if tokens and tokens[0][0] in ('STRING', 'NUMBER'):
+                val_kind, val = tokens.pop(0)
+                pname = f"p{param_idx}"
+                param_idx_local = param_idx
+                param_idx += 1
+                sql_op = {
+                    'eq': '=',
+                    'ne': '!=',
+                    'gt': '>',
+                    'ge': '>=',
+                    'lt': '<',
+                    'le': '<=',
+                }[op]
+                return f"{field} {sql_op} :{pname}", {pname: val}
+            else:
+                raise RuntimeError("Expected value after operator")
+        else:
+            raise RuntimeError(f"Unexpected token: {tok}")
+
+    def parse_and_or(lhs_sql, lhs_params):
+        nonlocal param_idx
+        while tokens and tokens[0][0] in ('AND', 'OR'):
+            op_kind, _ = pop()
+            rhs_sql, rhs_params = parse_atom()
+            if op_kind == 'AND':
+                lhs_sql = f"{lhs_sql} AND {rhs_sql}"
+            else:
+                lhs_sql = f"{lhs_sql} OR {rhs_sql}"
+            lhs_params.update(rhs_params)
+        return lhs_sql, lhs_params
+
+    def parse_expr():
+        atom_sql, atom_params = parse_atom()
+        return parse_and_or(atom_sql, atom_params)
+
+    sql, params = parse_expr()
+    return sql, params
+
+def safe_parse_filter(odata_filter, columns):
+    tokens = list(tokenize_filter(odata_filter))
+    sql, params = parse_filter_expr(tokens, columns)
+    if tokens:
+        raise RuntimeError("Unexpected tokens after parsing filter")
+    return sql, params
+
+# ----------------------------------------
+# Helper functions and endpoint logic
+# ----------------------------------------
+
+def parse_orderby(orderby_str, columns):
     orders = []
     for part in orderby_str.split(","):
         part = part.strip()
@@ -72,22 +172,27 @@ def simple_odata_orderby_to_sql(orderby_str, columns):
 
 def parse_odata_to_sql(query_params, columns):
     where_clause = ""
-    if "$filter" in query_params:
-        sql_filter = simple_odata_filter_to_sql(query_params["$filter"], columns)
-        if sql_filter:
-            where_clause = "WHERE " + sql_filter
+    filter_params = {}
+    if "$filter" in query_params and query_params["$filter"]:
+        try:
+            wc, fp = safe_parse_filter(query_params["$filter"], columns)
+            if wc:
+                where_clause = "WHERE " + wc
+                filter_params = fp
+        except Exception as e:
+            raise HTTPException(400, f"Error en filtro: {str(e)}")
     fields = columns
-    if "$select" in query_params:
+    if "$select" in query_params and query_params["$select"]:
         fields = [
             f.strip() for f in query_params["$select"].split(",")
             if f.strip() in columns
         ]
     order_clause = ""
-    if "$orderby" in query_params:
-        sql_order = simple_odata_orderby_to_sql(query_params["$orderby"], columns)
+    if "$orderby" in query_params and query_params["$orderby"]:
+        sql_order = parse_orderby(query_params["$orderby"], columns)
         if sql_order:
             order_clause = "ORDER BY " + sql_order
-    return fields, where_clause, order_clause
+    return fields, where_clause, order_clause, filter_params
 
 def get_pk_columns(table_obj):
     return [col.name for col in table_obj.primary_key.columns]
@@ -102,7 +207,6 @@ def get_autoinc_fields(table_obj):
     return [col.name for col in table_obj.columns if getattr(col, "autoincrement", False) or (col.primary_key and col.type.__class__.__name__ == "INTEGER")]
 
 def get_timestamp_fields(table_obj):
-    # Devuelve dos listas: [default_fields, onupdate_fields]
     default_fields = []
     onupdate_fields = []
     for col in table_obj.columns:
@@ -111,7 +215,6 @@ def get_timestamp_fields(table_obj):
             default_txt = str(col.server_default.arg).upper()
             if "CURRENT_TIMESTAMP" in default_txt:
                 default_fields.append(col.name)
-        # ON UPDATE CURRENT_TIMESTAMP
         extra = getattr(col, "extra", "").upper() if hasattr(col, "extra") else ""
         if "ON UPDATE" in extra or "ON UPDATE CURRENT_TIMESTAMP" in extra:
             onupdate_fields.append(col.name)
@@ -151,14 +254,14 @@ def make_get_all_endpoint(table_name, columns):
         if filter_: params["$filter"] = filter_
         if orderby: params["$orderby"] = orderby
         if select: params["$select"] = select
-        fields, where, order = parse_odata_to_sql(params, columns)
+        fields, where, order, filter_params = parse_odata_to_sql(params, columns)
         limit = page_size
         offset = (page - 1) * page_size
         count_query = f"SELECT COUNT(*) FROM {table_name} {where}"
         with engine.connect() as conn:
-            totalCount = conn.execute(text(count_query)).scalar()
+            totalCount = conn.execute(text(count_query), filter_params).scalar()
             query = f"SELECT {', '.join(fields)} FROM {table_name} {where} {order} LIMIT {limit} OFFSET {offset}"
-            result = conn.execute(text(query)).fetchall()
+            result = conn.execute(text(query), filter_params).fetchall()
         return {
             "status": True,
             "value": [dict(row._mapping) for row in result],
@@ -187,7 +290,6 @@ def make_create_item_endpoint(table_name, pk_columns, columns, autoinc_fields, d
             for field in autoinc_fields:
                 if field in item_clean and (item_clean[field] is None or item_clean[field] == 0 or item_clean[field] == "0"):
                     del item_clean[field]
-            # Quitar campos con default y onupdate en POST
             for field in set(default_ts_fields + onupdate_ts_fields):
                 if field in item_clean:
                     del item_clean[field]
