@@ -34,11 +34,17 @@ git clone https://github.com/Gizmedic-Org/MySQL-to-REST.git
 cd MySQL-to-REST
 </pre>
 
-Configura tu conexión a MySQL creando un archivo .env en el mismo directorio que docker-compose.yml con tu cadena de conexión:
+Configura tu conexión a MySQL creando un archivo .env en el mismo directorio que docker-compose.yml con tu cadena de conexión, el port en el que estará expuesta la API
+y si los endpoints utilizarán JWT para autenticarse:
 
 <pre>
 DATABASE_URL="mysql+pymysql://usuario:contraseña@host:puerto/nombre_base"
 API_PORT=8055
+JWT_AUTH=true
+JWT_SECRET=mysupersecretkeymysupersecretkey
+JWT_ALGO=HS256
+JWT_USER=admin
+JWT_PASS=clave
 </pre>
 
 Arrancá el contenedor:

@@ -1,12 +1,20 @@
-from fastapi import FastAPI, HTTPException, Query, Request, Path, Body
+from fastapi import FastAPI, HTTPException, Query, Request, Path, Body, Depends
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, MetaData, Table, text
 from sqlalchemy.engine.reflection import Inspector
 import sqlalchemy
 import os
 import re
 
-app = FastAPI(docs_url="/swagger")
+# --- JWT opcional ---
+JWT_AUTH = os.getenv("JWT_AUTH", "false").lower() == "true"
+JWT_SECRET = os.getenv("JWT_SECRET", "supersecret")
+JWT_ALGO = os.getenv("JWT_ALGO", "HS256")
+JWT_USER = os.getenv("JWT_USER", "admin")
+JWT_PASS = os.getenv("JWT_PASS", "admin")
+if JWT_AUTH:
+    import jwt
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -17,6 +25,26 @@ engine = create_engine(DATABASE_URL)
 metadata = MetaData()
 metadata.reflect(bind=engine)
 inspector = Inspector.from_engine(engine)
+
+# --- JWT security dependency (solo si JWT_AUTH) ---
+security = HTTPBearer()
+
+def _check_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGO])
+        return payload
+    except Exception as e:
+        raise HTTPException(status_code=403, detail="Invalid JWT")
+
+# Dependency factory
+def auth_dependency():
+    if JWT_AUTH:
+        return _check_jwt
+    else:
+        # No-op: No requiere autenticación
+        async def allow_any():
+            return True
+        return allow_any
 
 # ----------------------------------------
 # ODATA $filter advanced parser (safe)
@@ -56,7 +84,6 @@ def tokenize_filter(s):
         else:
             value = mo.group()
         yield (kind, value)
-
 
 def parse_filter_expr(tokens, columns, param_idx=0):
     def peek():
@@ -241,6 +268,57 @@ def get_column_types(table_obj, pk_columns):
                 type_map[col.name] = str
     return type_map
 
+# --- FastAPI app ---
+app = FastAPI(
+    docs_url="/swagger",
+    openapi_url="/openapi.json"
+)
+
+# --- Custom OpenAPI for Swagger Authorize button ---
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title="MySQL-to-REST API",
+        version="1.0.0",
+        description="Auto CRUD for MySQL with JWT",
+        routes=app.routes,
+    )
+    if JWT_AUTH:
+        openapi_schema["components"]["securitySchemes"] = {
+            "BearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT"
+            }
+        }
+        # Aplica seguridad a todos los paths
+        for path in openapi_schema["paths"].values():
+            for op in path.values():
+                op["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
+
+
+# --- Auth endpoint solo si JWT_AUTH ---
+if JWT_AUTH:
+    @app.post("/authenticate")
+    async def authenticate(data: dict = Body(...)):
+        user = data.get("username")
+        pwd = data.get("password")
+        if user == JWT_USER and pwd == JWT_PASS:
+            import time
+            payload = {"sub": user, "iat": int(time.time())}
+            token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+            return {"token": token}
+        raise HTTPException(403, "Invalid username or password")
+
+# --- Handler de errores global ---
 @app.exception_handler(Exception)
 async def catch_all_exceptions(request: Request, exc: Exception):
     return JSONResponse(status_code=200, content={
@@ -264,7 +342,6 @@ def make_get_all_endpoint(table_name, columns):
         limit = page_size
         offset = (page - 1) * page_size
         count_query = f"SELECT COUNT(*) FROM {table_name} {where}"
-        
         with engine.connect() as conn:
             totalCount = conn.execute(text(count_query), filter_params).scalar()
             query = f"SELECT {', '.join(fields)} FROM {table_name} {where} {order} LIMIT {limit} OFFSET {offset}"
@@ -329,7 +406,6 @@ async def endpoint(item: dict = Body(...), {params_code}):
     with engine.connect() as conn:
         item_clean = {{k: v for k, v in item.items() if k not in pk_kwargs and k not in {onupdate_ts_fields!r}}}
         if not item_clean:
-            # Forzar update dummy para disparar ON UPDATE (modificación de timestamp)
             non_pk_fields = [c for c in {columns!r} if c not in pk_kwargs and c not in {onupdate_ts_fields!r}]
             if non_pk_fields:
                 dummy_field = non_pk_fields[0]
@@ -384,7 +460,7 @@ for name in all_views:
     table_obj = Table(name, metadata, autoload_with=engine)
     columns = [col.name for col in table_obj.columns]
     endpoint = f"/{name}"
-    app.get(endpoint)(make_get_all_endpoint(name, columns))
+    app.get(endpoint, dependencies=[Depends(auth_dependency())])(make_get_all_endpoint(name, columns))
 
 # --- CRUD para TABLAS ---
 all_tables = inspector.get_table_names()
@@ -397,7 +473,7 @@ for name in all_tables:
     default_ts_fields, onupdate_ts_fields = get_timestamp_fields(table_obj)
     endpoint = f"/{name}"
 
-    app.get(endpoint)(make_get_all_endpoint(name, columns))
+    app.get(endpoint, dependencies=[Depends(auth_dependency())])(make_get_all_endpoint(name, columns))
 
     if pk_columns:
         route = endpoint + get_path_params(pk_columns)
@@ -412,13 +488,13 @@ async def endpoint({params_code}):
             local_vars = {"handler_func": make_get_by_pk_endpoint(name, pk_columns), "Path": Path}
             exec(func_code, local_vars)
             return local_vars["endpoint"]
-        app.get(route)(endpoint_factory_with_pk(pk_types))
+        app.get(route, dependencies=[Depends(auth_dependency())])(endpoint_factory_with_pk(pk_types))
 
         # PUT by PK (Swagger-friendly, body+pk in URL)
-        app.put(route)(make_update_item_endpoint(name, pk_columns, columns, onupdate_ts_fields)(pk_types))
+        app.put(route, dependencies=[Depends(auth_dependency())])(make_update_item_endpoint(name, pk_columns, columns, onupdate_ts_fields)(pk_types))
 
         # DELETE by PK
-        app.delete(route)(make_delete_item_endpoint(name, pk_columns, columns)(pk_types))
+        app.delete(route, dependencies=[Depends(auth_dependency())])(make_delete_item_endpoint(name, pk_columns, columns)(pk_types))
 
         # POST
-        app.post(endpoint)(make_create_item_endpoint(name, pk_columns, columns, autoinc_fields, default_ts_fields, onupdate_ts_fields))
+        app.post(endpoint, dependencies=[Depends(auth_dependency())])(make_create_item_endpoint(name, pk_columns, columns, autoinc_fields, default_ts_fields, onupdate_ts_fields))
