@@ -23,7 +23,6 @@ inspector = Inspector.from_engine(engine)
 # ----------------------------------------
 
 def tokenize_filter(s):
-    # Simple lexer for OData expressions (only the supported subset)
     token_specification = [
         ('LPAREN', r'\('),
         ('RPAREN', r'\)'),
@@ -41,16 +40,23 @@ def tokenize_filter(s):
     tok_regex = '|'.join('(?P<%s>%s)' % pair for pair in token_specification)
     for mo in re.finditer(tok_regex, s):
         kind = mo.lastgroup
-        value = mo.group()
         if kind == 'SKIP':
             continue
-        elif kind == 'STRING':
-            value = mo.group(1)
+        if kind == 'STRING':
+            groups = mo.groups()
+            value = next((g for g in groups if g is not None), None)
+            # Filtro defensivo: saca comillas si aún las tiene
+            if value and value.startswith("'") and value.endswith("'"):
+                value = value[1:-1]
         elif kind == 'NUMBER':
+            value = mo.group()
             value = float(value) if '.' in value else int(value)
         elif kind == 'MISMATCH':
-            raise RuntimeError(f'Unexpected character: {value}')
+            raise RuntimeError(f'Unexpected character: {mo.group()}')
+        else:
+            value = mo.group()
         yield (kind, value)
+
 
 def parse_filter_expr(tokens, columns, param_idx=0):
     def peek():
@@ -258,6 +264,7 @@ def make_get_all_endpoint(table_name, columns):
         limit = page_size
         offset = (page - 1) * page_size
         count_query = f"SELECT COUNT(*) FROM {table_name} {where}"
+        
         with engine.connect() as conn:
             totalCount = conn.execute(text(count_query), filter_params).scalar()
             query = f"SELECT {', '.join(fields)} FROM {table_name} {where} {order} LIMIT {limit} OFFSET {offset}"
