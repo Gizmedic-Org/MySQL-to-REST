@@ -29,17 +29,23 @@ Ideal para exponer tu base como una API moderna con soporte de filtros, selecci�
 
 Cloná el repositorio (o copiá estos archivos en tu proyecto):
 
+<pre>
 git clone https://github.com/Gizmedic-Org/MySQL-to-REST.git
 cd MySQL-to-REST
+</pre>
 
 Configura tu conexión a MySQL creando un archivo .env en el mismo directorio que docker-compose.yml con tu cadena de conexión:
 
+<pre>
 DATABASE_URL="mysql+pymysql://usuario:contraseña@host:puerto/nombre_base"
 API_PORT=8055
+</pre>
 
 Arrancá el contenedor:
 
+<pre>
 docker compose up --build
+</pre>
 
 La API estará disponible en http://localhost:8055 (o el puerto que definas en .env).
 
@@ -51,47 +57,55 @@ Accede a http://localhost:8055/swagger para ver y probar todos los endpoints gen
 
 ---
 
-Ejemplo de uso:
+### Ejemplo de uso:
 
 1. GET (con filtros, orden y paginación):
 
-GET /usuarios?$filter=activo eq 1&$orderby=nombre desc&$select=id,nombre,apellido&$page=1&$pageSize=10
-
+  <pre>
+  GET /usuarios?$filter=activo eq 1&$orderby=nombre desc&$select=id,nombre,apellido&$page=1&$pageSize=10
+  </pre>
+  
 2. GET un registro por PK:
 
-GET /usuarios/1424
+  <pre>
+    GET /usuarios/1424
+  </pre>
 
 3. POST (crear un usuario):
 
-POST /usuarios
-Content-Type: application/json
-
-{
-  "codigoInterno": "test",
-  "nombre": "TEST",
-  "apellido": "",
-  "numeroCedula": "12345678",
-  "numeroCredencial": "12345678",
-  "fechaNacimiento": "1966-04-22T00:00:00",
-  "genero": "M",
-  "whatsapp": "4444444",
-  "activo": 1,
-  "token": "alekfjsklmwsoiefjflsmdflds"
-}
+  <pre>
+    POST /usuarios
+    Content-Type: application/json
+    {
+      "codigoInterno": "test",
+      "nombre": "TEST",
+      "apellido": "",
+      "numeroCedula": "12345678",
+      "numeroCredencial": "12345678",
+      "fechaNacimiento": "1966-04-22T00:00:00",
+      "genero": "M",
+      "whatsapp": "4444444",
+      "activo": 1,
+      "token": "alekfjsklmwsoiefjflsmdflds"
+    }
+  </pre>
 
 4. PUT (modificar un usuario, con id en la URL):
 
-PUT /usuarios/1424
-Content-Type: application/json
-
-{
-  "nombre": "TEST ACTUALIZADO",
-  "activo": 0
-}
+  <pre>
+    PUT /usuarios/1424
+    Content-Type: application/json
+    {
+      "nombre": "TEST ACTUALIZADO",
+      "activo": 0
+    }
+  </pre>
 
 5. DELETE (eliminar un usuario):
 
-DELETE /usuarios/1424
+  <pre>
+    DELETE /usuarios/1424
+  </pre>
 
 ---
 
