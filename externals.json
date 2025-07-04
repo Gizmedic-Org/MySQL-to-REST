@@ -1,9 +1,14 @@
 {
     "externals": [
         {
-            "route": "/atenciones/schema",
+            "route": "/external/atenciones/schema",
             "type": "FILE",
-            "destination": "files/atenciones_chema.json"
+            "destination": "files/atenciones_schema.json"
+        },
+        {
+            "route": "/external/objetos",
+            "type": "GET",
+            "destination": "https://api.restful-api.dev/objects?id=3&id=5&id=10"
         }
     ]
 }
