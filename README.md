@@ -133,7 +133,7 @@ DELETE (eliminar un usuario):
 
 <pre>
 DELETE /usuarios/1424
-<pre>
+</pre>
 
 GET externo desde archivo JSON:
 
