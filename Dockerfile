@@ -2,14 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Instala dependencias de sistema, incluido git
-RUN apt-get update && apt-get install -y gcc default-libmysqlclient-dev 
+# Instala dependencias de sistema
+RUN apt-get update && apt-get install -y gcc default-libmysqlclient-dev
 
 # Copia requerimientos y los instala
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Copia tu código fuente
+# Copia el código fuente (incluye .files y externals.json)
 COPY . .
 
 EXPOSE 8000

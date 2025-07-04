@@ -1,55 +1,144 @@
+# MIT License
+#
+# Copyright (c) 2025 Gizmedic
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Author: Ariel R. Iriarte (airiarte@gizmedic.com) / Gizmedic (https://github.com/Gizmedic-Org)
+
+import os
+import re
+import json
 from fastapi import FastAPI, HTTPException, Query, Request, Path, Body, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, MetaData, Table, text
 from sqlalchemy.engine.reflection import Inspector
 import sqlalchemy
-import os
-import re
+import httpx
+from datetime import datetime, timedelta
+from jose import jwt
+import secrets
 
-# --- JWT opcional ---
-JWT_AUTH = os.getenv("JWT_AUTH", "false").lower() == "true"
-JWT_SECRET = os.getenv("JWT_SECRET", "supersecret")
+# --------- CONFIG & ENV ------------
+def get_env_bool(name, default=False):
+    val = os.getenv(name)
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).lower() in ("true", "1", "yes")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://usuario:clave@localhost:3306/tu_base")
+API_PORT = int(os.getenv("API_PORT", 8055))
+JWT_AUTH = get_env_bool("JWT_AUTH", False)
+JWT_SECRET = os.getenv("JWT_SECRET", "mysupersecretkeymysupersecretkey")
 JWT_ALGO = os.getenv("JWT_ALGO", "HS256")
 JWT_USER = os.getenv("JWT_USER", "admin")
-JWT_PASS = os.getenv("JWT_PASS", "admin")
-if JWT_AUTH:
-    import jwt
+JWT_PASS = os.getenv("JWT_PASS", "clave")
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "mysql+pymysql://usuario:clave@localhost:3306/tu_base"
+app = FastAPI(
+    docs_url="/swagger",
+    title="MySQL-to-REST",
+    description="API automática para exponer MySQL como REST + Endpoints externos y JWT opcional.",
+    version="1.0.0"
 )
 
+# --------- JWT BEARER -----------
+class JWTBearer(HTTPBearer):
+    def __init__(self, auto_error=True):
+        super(JWTBearer, self).__init__(auto_error=auto_error)
+    async def __call__(self, request):
+        if not JWT_AUTH:
+            return None
+        credentials: HTTPAuthorizationCredentials = await super(JWTBearer, self).__call__(request)
+        if credentials:
+            try:
+                payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGO])
+                return payload
+            except Exception:
+                raise HTTPException(status_code=401, detail="Invalid or expired token")
+        else:
+            raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+def auth_dependency():
+    if JWT_AUTH:
+        return JWTBearer()
+    else:
+        async def dummy_dep():
+            return True
+        return dummy_dep
+
+# ---------- JWT AUTH ENDPOINT (solo si JWT_AUTH) -------------
+if JWT_AUTH:
+    @app.post("/authenticate", tags=["Auth"])
+    async def authenticate(data: dict = Body(...)):
+        user = str(data.get("username") or data.get("user") or "")
+        pw = str(data.get("password") or data.get("pass") or "")
+        if user == JWT_USER and pw == JWT_PASS:
+            payload = {
+                "sub": user,
+                "iat": int(datetime.utcnow().timestamp()),
+                "rand": secrets.token_hex(8),
+                "exp": datetime.utcnow() + timedelta(hours=24)
+            }
+            token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+            return {"status": True, "value": {"token": token}}
+        else:
+            return {"status": False, "value": "Invalid username or password"}
+        
+# ------ Swagger Bearer FIX -----
+from fastapi.openapi.utils import get_openapi
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    if JWT_AUTH:
+        openapi_schema["components"]["securitySchemes"] = {
+            "BearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT"
+            }
+        }
+        for path in openapi_schema["paths"]:
+            for method in openapi_schema["paths"][path]:
+                if path.startswith("/authenticate"):
+                    continue
+                if "security" not in openapi_schema["paths"][path][method]:
+                    openapi_schema["paths"][path][method]["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+app.openapi = custom_openapi
+
+# --------- DB Reflection -----------
 engine = create_engine(DATABASE_URL)
 metadata = MetaData()
 metadata.reflect(bind=engine)
 inspector = Inspector.from_engine(engine)
 
-# --- JWT security dependency (solo si JWT_AUTH) ---
-security = HTTPBearer()
-
-def _check_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGO])
-        return payload
-    except Exception as e:
-        raise HTTPException(status_code=403, detail="Invalid JWT")
-
-# Dependency factory
-def auth_dependency():
-    if JWT_AUTH:
-        return _check_jwt
-    else:
-        # No-op: No requiere autenticación
-        async def allow_any():
-            return True
-        return allow_any
-
-# ----------------------------------------
-# ODATA $filter advanced parser (safe)
-# ----------------------------------------
-
+# --------- ODATA FILTER HELPERS ---------
 def tokenize_filter(s):
     token_specification = [
         ('LPAREN', r'\('),
@@ -73,7 +162,6 @@ def tokenize_filter(s):
         if kind == 'STRING':
             groups = mo.groups()
             value = next((g for g in groups if g is not None), None)
-            # Filtro defensivo: saca comillas si aún las tiene
             if value and value.startswith("'") and value.endswith("'"):
                 value = value[1:-1]
         elif kind == 'NUMBER':
@@ -109,7 +197,6 @@ def parse_filter_expr(tokens, columns, param_idx=0):
             if not tokens or tokens[0][0] != 'LPAREN':
                 raise RuntimeError("Expected '(' after contains")
             pop()
-            # next token: field
             if not tokens or tokens[0][0] != 'ID':
                 raise RuntimeError("Expected field name in contains")
             field = tokens.pop(0)[1]
@@ -133,11 +220,9 @@ def parse_filter_expr(tokens, columns, param_idx=0):
             if field not in columns:
                 raise RuntimeError(f"Invalid field '{field}'")
             pop()
-            # next: OP
             if not tokens or tokens[0][0] != 'OP':
                 raise RuntimeError("Expected operator after field")
             op = tokens.pop(0)[1]
-            # next: STRING or NUMBER
             if tokens and tokens[0][0] in ('STRING', 'NUMBER'):
                 val_kind, val = tokens.pop(0)
                 pname = f"p{param_idx}"
@@ -182,10 +267,6 @@ def safe_parse_filter(odata_filter, columns):
     if tokens:
         raise RuntimeError("Unexpected tokens after parsing filter")
     return sql, params
-
-# ----------------------------------------
-# Helper functions and endpoint logic
-# ----------------------------------------
 
 def parse_orderby(orderby_str, columns):
     orders = []
@@ -243,7 +324,6 @@ def get_timestamp_fields(table_obj):
     default_fields = []
     onupdate_fields = []
     for col in table_obj.columns:
-        # DEFAULT CURRENT_TIMESTAMP
         if hasattr(col, "server_default") and col.server_default is not None:
             default_txt = str(col.server_default.arg).upper()
             if "CURRENT_TIMESTAMP" in default_txt:
@@ -254,7 +334,6 @@ def get_timestamp_fields(table_obj):
     return default_fields, onupdate_fields
 
 def get_column_types(table_obj, pk_columns):
-    import sqlalchemy
     type_map = {}
     for col in table_obj.columns:
         if col.name in pk_columns:
@@ -268,57 +347,6 @@ def get_column_types(table_obj, pk_columns):
                 type_map[col.name] = str
     return type_map
 
-# --- FastAPI app ---
-app = FastAPI(
-    docs_url="/swagger",
-    openapi_url="/openapi.json"
-)
-
-# --- Custom OpenAPI for Swagger Authorize button ---
-from fastapi.openapi.utils import get_openapi
-
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title="MySQL-to-REST API",
-        version="1.0.0",
-        description="Auto CRUD for MySQL with JWT",
-        routes=app.routes,
-    )
-    if JWT_AUTH:
-        openapi_schema["components"]["securitySchemes"] = {
-            "BearerAuth": {
-                "type": "http",
-                "scheme": "bearer",
-                "bearerFormat": "JWT"
-            }
-        }
-        # Aplica seguridad a todos los paths
-        for path in openapi_schema["paths"].values():
-            for op in path.values():
-                op["security"] = [{"BearerAuth": []}]
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-app.openapi = custom_openapi
-
-
-
-# --- Auth endpoint solo si JWT_AUTH ---
-if JWT_AUTH:
-    @app.post("/authenticate")
-    async def authenticate(data: dict = Body(...)):
-        user = data.get("username")
-        pwd = data.get("password")
-        if user == JWT_USER and pwd == JWT_PASS:
-            import time
-            payload = {"sub": user, "iat": int(time.time())}
-            token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-            return {"token": token}
-        raise HTTPException(403, "Invalid username or password")
-
-# --- Handler de errores global ---
 @app.exception_handler(Exception)
 async def catch_all_exceptions(request: Request, exc: Exception):
     return JSONResponse(status_code=200, content={
@@ -326,6 +354,7 @@ async def catch_all_exceptions(request: Request, exc: Exception):
         "value": str(exc)
     })
 
+# ---- CRUD para Vistas (GET) ----
 def make_get_all_endpoint(table_name, columns):
     async def get_all(
         filter_: str = Query(default=None, alias="$filter"),
@@ -355,6 +384,7 @@ def make_get_all_endpoint(table_name, columns):
         }
     return get_all
 
+# --- Más helpers para CRUD ---
 def make_get_by_pk_endpoint(table_name, pk_columns):
     async def get_by_pk(**kwargs):
         pk_kwargs = get_pk_kwargs(pk_columns, **kwargs)
@@ -416,7 +446,7 @@ async def endpoint(item: dict = Body(...), {params_code}):
         else:
             sets = ", ".join([f"{{k}}=:{{k}}" for k in item_clean.keys()])
             params = {{**item_clean, **pk_kwargs}}
-        where = " AND ".join([f"{{col}}=:{{col}}" for col in pk_kwargs.keys()])
+        where = " AND ".join([f"{{col}}=:{{col}}" for col in pk_kwargs.keys()]) 
         query = f"UPDATE {table_name} SET {{sets}} WHERE {{where}}"
         res = conn.execute(text(query), params)
         conn.commit()
@@ -454,17 +484,18 @@ async def endpoint({params_code}):
         return local_vars["endpoint"]
     return endpoint_factory
 
-# --- SOLO GET para VISTAS ---
-all_views = inspector.get_view_names()
-for name in all_views:
+# ---------- REGISTRO DE RUTAS ----------
+# Vistas (solo GET)
+for name in inspector.get_view_names():
     table_obj = Table(name, metadata, autoload_with=engine)
     columns = [col.name for col in table_obj.columns]
-    endpoint = f"/{name}"
-    app.get(endpoint, dependencies=[Depends(auth_dependency())])(make_get_all_endpoint(name, columns))
+    if JWT_AUTH:
+        app.get(f"/{name}", tags=["Views"], dependencies=[Depends(auth_dependency)])(make_get_all_endpoint(name, columns))
+    else:
+        app.get(f"/{name}", tags=["Views"])(make_get_all_endpoint(name, columns))
 
-# --- CRUD para TABLAS ---
-all_tables = inspector.get_table_names()
-for name in all_tables:
+# CRUD para tablas
+for name in inspector.get_table_names():
     table_obj = Table(name, metadata, autoload_with=engine)
     columns = [col.name for col in table_obj.columns]
     pk_columns = get_pk_columns(table_obj)
@@ -473,11 +504,13 @@ for name in all_tables:
     default_ts_fields, onupdate_ts_fields = get_timestamp_fields(table_obj)
     endpoint = f"/{name}"
 
-    app.get(endpoint, dependencies=[Depends(auth_dependency())])(make_get_all_endpoint(name, columns))
+    if JWT_AUTH:
+        app.get(endpoint, tags=["Tables"], dependencies=[Depends(auth_dependency)])(make_get_all_endpoint(name, columns))
+    else:
+        app.get(endpoint, tags=["Tables"])(make_get_all_endpoint(name, columns))
 
     if pk_columns:
         route = endpoint + get_path_params(pk_columns)
-        # GET by PK
         def endpoint_factory_with_pk(pk_types):
             params_code = ", ".join([f"{col}: {pk_types[col].__name__} = Path(...)" for col in pk_columns])
             func_code = f"""
@@ -488,13 +521,77 @@ async def endpoint({params_code}):
             local_vars = {"handler_func": make_get_by_pk_endpoint(name, pk_columns), "Path": Path}
             exec(func_code, local_vars)
             return local_vars["endpoint"]
-        app.get(route, dependencies=[Depends(auth_dependency())])(endpoint_factory_with_pk(pk_types))
+        if JWT_AUTH:
+            app.get(route, tags=["Tables"], dependencies=[Depends(auth_dependency)])(endpoint_factory_with_pk(pk_types))
+            app.put(route, tags=["Tables"], dependencies=[Depends(auth_dependency)])(make_update_item_endpoint(name, pk_columns, columns, onupdate_ts_fields)(pk_types))
+            app.delete(route, tags=["Tables"], dependencies=[Depends(auth_dependency)])(make_delete_item_endpoint(name, pk_columns, columns)(pk_types))
+            app.post(endpoint, tags=["Tables"], dependencies=[Depends(auth_dependency)])(make_create_item_endpoint(name, pk_columns, columns, autoinc_fields, default_ts_fields, onupdate_ts_fields))
+        else:
+            app.get(route, tags=["Tables"])(endpoint_factory_with_pk(pk_types))
+            app.put(route, tags=["Tables"])(make_update_item_endpoint(name, pk_columns, columns, onupdate_ts_fields)(pk_types))
+            app.delete(route, tags=["Tables"])(make_delete_item_endpoint(name, pk_columns, columns)(pk_types))
+            app.post(endpoint, tags=["Tables"])(make_create_item_endpoint(name, pk_columns, columns, autoinc_fields, default_ts_fields, onupdate_ts_fields))
 
-        # PUT by PK (Swagger-friendly, body+pk in URL)
-        app.put(route, dependencies=[Depends(auth_dependency())])(make_update_item_endpoint(name, pk_columns, columns, onupdate_ts_fields)(pk_types))
+# ------- Externals: FILE/GET/POST/PUT/DELETE ---------
+def make_file_endpoint(abs_dest):
+    async def file_endpoint():
+        if not os.path.exists(abs_dest):
+            return JSONResponse({"status": False, "value": f"File not found: {abs_dest}"}, status_code=404)
+        return FileResponse(abs_dest, media_type="application/json")
+    return file_endpoint
 
-        # DELETE by PK
-        app.delete(route, dependencies=[Depends(auth_dependency())])(make_delete_item_endpoint(name, pk_columns, columns)(pk_types))
+def make_external_get_endpoint(url):
+    async def external_get():
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=20) as client:
+                resp = await client.get(url)
+                try:
+                    data = resp.json()
+                    return {"status": True, "value": data}
+                except Exception:
+                    return Response(content=resp.content, media_type=resp.headers.get("content-type", "application/octet-stream"), status_code=resp.status_code)
+        except Exception as e:
+            return JSONResponse({"status": False, "value": f"Error externo: {str(e)}"}, status_code=502)
+    return external_get
 
-        # POST
-        app.post(endpoint, dependencies=[Depends(auth_dependency())])(make_create_item_endpoint(name, pk_columns, columns, autoinc_fields, default_ts_fields, onupdate_ts_fields))
+def make_external_other_endpoint(method, url):
+    async def endpoint(body: dict = Body(None)):
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=20) as client:
+                method_func = getattr(client, method.lower())
+                resp = await method_func(url, json=body)
+                try:
+                    data = resp.json()
+                    return {"status": True, "value": data}
+                except Exception:
+                    return Response(content=resp.content, media_type=resp.headers.get("content-type", "application/octet-stream"), status_code=resp.status_code)
+        except Exception as e:
+            return JSONResponse({"status": False, "value": f"Error externo: {str(e)}"}, status_code=502)
+    return endpoint
+
+externals_path = os.path.join(os.path.dirname(__file__), "externals.json")
+if os.path.exists(externals_path):
+    try:
+        with open(externals_path, "r", encoding="utf-8") as f:
+            externals = json.load(f)
+        for ext in externals.get("externals", []):
+            route = ext.get("route")
+            type_ = ext.get("type")
+            dest = ext.get("destination")
+            if not (route and type_ and dest):
+                continue
+            tags = ["Externals"]
+            kwargs = {"tags": tags}
+            if JWT_AUTH:
+                kwargs["dependencies"] = [Depends(auth_dependency)]
+            if type_.upper() == "FILE":
+                abs_path = os.path.abspath(dest if os.path.isabs(dest) else os.path.join(os.path.dirname(__file__), dest))
+                app.add_api_route(route, make_file_endpoint(abs_path), methods=["GET"], **kwargs)
+            elif type_.upper() == "GET":
+                app.add_api_route(route, make_external_get_endpoint(dest), methods=["GET"], **kwargs)
+            elif type_.upper() in ("POST", "PUT", "DELETE"):
+                app.add_api_route(route, make_external_other_endpoint(type_, dest), methods=[type_.upper()], **kwargs)
+    except Exception as e:
+        print("Error loading externals:", e)
+
+# --------------- END ---------------

@@ -1,0 +1,9 @@
+{
+    "externals": [
+        {
+            "route": "/atenciones/schema",
+            "type": "FILE",
+            "destination": "files/atenciones_chema.json"
+        }
+    ]
+}

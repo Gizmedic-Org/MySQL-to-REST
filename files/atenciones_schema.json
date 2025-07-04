@@ -1,0 +1,64 @@
+{
+    "fields": [
+        {
+            "name": "id",
+            "caption": "Id",
+            "type": "key",
+            "list": false,
+            "validation": {
+                "required": true
+            },
+            "defaultValue": "()=>0"
+        },
+        {
+            "name": "descripcion",
+            "caption": "Descripción",
+            "type": "hidden",
+            "list": true
+        },
+        {
+            "name": "idObraSocial",
+            "caption": "Obra social",
+            "type": "SimpleSelectOqt",
+            "options": "obras_sociales",
+            "list": false,
+            "validation": {
+                "required": false
+            }
+        },
+        {
+            "name": "fechaHoraVencimiento",
+            "caption": "Fecha de vencimiento",
+            "type": "DatePickerOqt",
+            "validation": {
+                "required": true
+            },
+            "list": false
+        },
+        {
+            "name": "idUsuario",
+            "caption": "Id de usuario",
+            "type": "SimpleSelectOqt",
+            "options": "usuarios",
+            "list": false,
+            "validation": {
+                "required": true
+            }
+        },
+        {
+            "name": "item",
+            "caption": "Items",
+            "type": "TabFormOqt",
+            "section": "item",
+            "maxWidth": "sm",
+            "list": false
+        },
+        {
+            "name": "requerimiento",
+            "caption": "Requerimientos",
+            "type": "TabFormOqt",
+            "section": "requerimiento",
+            "maxWidth": "sm"
+        }
+    ]
+}
