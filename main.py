@@ -32,9 +32,33 @@ from sqlalchemy import create_engine, MetaData, Table, text
 from sqlalchemy.engine.reflection import Inspector
 import sqlalchemy
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from jose import jwt
 import secrets
+import sqlite3
+import threading
+
+API_LOG_DB_FILE = os.getenv("API_LOG_DB_FILE", "api_requests_log.db")
+log_lock = threading.Lock()
+
+# --------- TABLA DE LOGS ------------
+def ensure_log_table():
+    with log_lock:
+        conn = sqlite3.connect(API_LOG_DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS api_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint TEXT,
+                method TEXT,
+                status_code INTEGER,
+                timestamp TEXT,
+                duration_ms INTEGER
+            );
+        """)
+        conn.commit()
+        conn.close()
+ensure_log_table()
 
 # --------- CONFIG & ENV ------------
 def get_env_bool(name, default=False):
@@ -59,6 +83,26 @@ app = FastAPI(
     description="API automática para exponer MySQL como REST + Endpoints externos y JWT opcional.",
     version="1.0.0"
 )
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    import time
+    start_time = time.time()
+    response = await call_next(request)
+    duration_ms = int((time.time() - start_time) * 1000)
+    endpoint = request.url.path
+    method = request.method
+    status_code = response.status_code
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with log_lock:
+        conn = sqlite3.connect(API_LOG_DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO api_logs (endpoint, method, status_code, timestamp, duration_ms) VALUES (?, ?, ?, ?, ?)",
+                  (endpoint, method, status_code, timestamp, duration_ms))
+        conn.commit()
+        conn.close()
+    return response
+
 
 # --------- JWT BEARER -----------
 class JWTBearer(HTTPBearer):
@@ -92,11 +136,12 @@ if JWT_AUTH:
         user = str(data.get("username") or data.get("user") or "")
         pw = str(data.get("password") or data.get("pass") or "")
         if user == JWT_USER and pw == JWT_PASS:
+            now_utc = datetime.now(timezone.utc)
             payload = {
                 "sub": user,
-                "iat": int(datetime.utcnow().timestamp()),
+                "iat": int(now_utc.timestamp()),
                 "rand": secrets.token_hex(8),
-                "exp": datetime.utcnow() + timedelta(hours=24)
+                "exp": now_utc + timedelta(hours=24)
             }
             token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
             return {"status": True, "value": {"token": token}}
@@ -593,5 +638,57 @@ if os.path.exists(externals_path):
                 app.add_api_route(route, make_external_other_endpoint(type_, dest), methods=[type_.upper()], **kwargs)
     except Exception as e:
         print("Error loading externals:", e)
+
+import sqlite3
+from fastapi import Query
+
+# ---------- API LOGS ENDPOINTS ---------------
+@app.get("/getApiLogs", tags=["Internal"])
+async def get_api_logs(
+    since: int = Query(None, description="Filtra por logs de las últimas X horas"),
+    endpoint: str = Query(None, description="Filtra por substring en el endpoint (case-insensitive)")
+):
+    import datetime
+    logs = []
+    query = "SELECT endpoint, method, status_code, timestamp, duration_ms FROM api_logs"
+    params = []
+    conditions = []
+
+    if since is not None:
+        since_dt = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=since)).strftime("%Y-%m-%d %H:%M:%S")
+        conditions.append("timestamp >= ?")
+        params.append(since_dt)
+    if endpoint:
+        conditions.append("LOWER(endpoint) LIKE ?")
+        params.append(f"%{endpoint.lower()}%")
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY timestamp DESC"
+
+    conn = sqlite3.connect(API_LOG_DB_FILE)
+    c = conn.cursor()
+    rows = c.execute(query, params).fetchall()
+    for row in rows:
+        logs.append({
+            "endpoint": row[0],
+            "method": row[1],
+            "status_code": row[2],
+            "timestamp": row[3],
+            "duration_ms": row[4]
+        })
+    conn.close()
+    return {"status": True, "value": logs}
+
+
+@app.post("/resetApiLogs", tags=["Internal"])
+async def reset_api_logs():
+    conn = sqlite3.connect(API_LOG_DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM api_logs")
+    conn.commit()
+    conn.close()
+    return {"status": True, "value": "Todos los logs fueron eliminados."}
+
 
 # --------------- END ---------------

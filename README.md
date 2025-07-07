@@ -33,9 +33,11 @@ Cloná el repositorio (o copiá estos archivos en tu proyecto):
 ```sh
 git clone https://github.com/Gizmedic-Org/MySQL-to-REST.git
 cd MySQL-to-REST
+touch api_requests_log.db
+chmod 666 api_requests_logs.db
 ```
 
-Configura tu conexión a MySQL creando un archivo .env en el mismo directorio que docker-compose.yml con tu cadena de conexión, el puerto en el que estará expuesta la API
+Configura tu conexión a MySQL creando un archivo **.env** en el mismo directorio que docker-compose.yml con tu cadena de conexión, el puerto en el que se expone la API
 y si los endpoints utilizarán JWT para autenticarse:
 
 <pre>

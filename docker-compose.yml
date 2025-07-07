@@ -5,11 +5,13 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      API_LOG_DB_FILE: /app/api_requests_log.db       
     ports:
       - "${API_PORT:-8055}:8000"
     volumes:
       - ./externals.json:/app/externals.json:ro
       - ./files:/app/files:ro
+      - ./api_requests_log.db:/app/api_requests_log.db         
     networks:
       - fastapi-net
 
